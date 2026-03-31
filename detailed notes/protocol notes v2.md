@@ -259,9 +259,9 @@ macro "Phase 1 - Draw Compartment Masks" {
 
     for (i = 0; i < list.length; i++) {
         fname = list[i];
-        if (!endsWith(fname, "_SD_QC.tiff")) continue;
+        if (!endsWith(fname, "_std_dev.tif")) continue;
 
-        baseName  = replace(fname, "_SD_QC.tiff", "");
+        baseName  = replace(fname, "_std_dev.tif", "");
         maskPath  = maskDir + baseName + "_masks.tif";
 
         // Skip files already processed
@@ -298,7 +298,7 @@ macro "Phase 1 - Draw Compartment Masks" {
         run("16-bit");
         roiManager("reset");
 
-        // ---- CYTOPLASM ----
+       // ---- CYTOPLASM ----
         selectWindow(projTitle);
         setTool("freehand");
         waitForUser("CYTOPLASM  [" + baseName + "]",
@@ -311,14 +311,17 @@ macro "Phase 1 - Draw Compartment Masks" {
             continue;
         }
         roiManager("Add");
-
         newImage("CytoMask", "8-bit black", w, h, 1);
         roiManager("Select", 0);
         setForegroundColor(255, 255, 255);
         run("Fill", "slice");
         run("Select None");
+        // Morphological close to fill gaps in drawn boundary
+        run("Close-");
         run("16-bit");
         roiManager("reset");
+        // Subtract nuclear region so no pixel belongs to both masks
+        imageCalculator("Subtract", "CytoMask", "NucMask");
 
         // ---- Merge to 2-channel mask image and save ----
         // c1 = Nuc (red LUT for identification), c2 = Cyto (green LUT)
@@ -381,6 +384,9 @@ macro "Phase 2 - Merge Raw Stacks with Masks" {
         // Read frame interval from embedded metadata (seconds)
         frameInterval = Stack.getFrameInterval();
 
+        //photobleach correction
+        run("Bleach Correction", "correction=[Exponential Fit]");
+
         // Subtract background
         run("Subtract Background...", "rolling=20 stack");
 
@@ -389,54 +395,74 @@ macro "Phase 2 - Merge Raw Stacks with Masks" {
 
         // --- 2. Open 2-channel mask and split ---
         open(maskPath);
-        maskTitle = getTitle();   // e.g. "baseName_masks.tif"
+        maskTitle = getTitle();
         run("Split Channels");
-        // Split produces: "C1-<maskTitle>" (Nuc) and "C2-<maskTitle>" (Cyto)
         nucSingleTitle  = "C1-" + maskTitle;
         cytoSingleTitle = "C2-" + maskTitle;
 
-        // --- 3. Expand each 2-D mask to a full-depth stack ---
-        expandToStack(nucSingleTitle,  totalFrames, "NucMask");
-        expandToStack(cytoSingleTitle, totalFrames, "CytoMask");
+        // --- 3. Build single label mask: Cyto=1, Nuc=2 ---
+        // Masks are 16-bit with filled pixels at 255
+        selectWindow(cytoSingleTitle);
+        run("Divide...", "value=255");   // → 0 or 1
+        rename("LabelMask");
 
-        // --- 4. Build edge stacks BEFORE merge (merge consumes its inputs) ---
-        selectWindow("CytoMask");
-        run("Duplicate...", "duplicate");
-        rename("CytoEdges");
-        selectWindow("CytoEdges");
-        run("Find Edges", "stack");
+        selectWindow(nucSingleTitle);
+        run("Divide...", "value=255");   // → 0 or 1
+        run("Multiply...", "value=2");     // → 0 or 2
+        rename("NucLabel");
+
+        imageCalculator("Add", "LabelMask", "NucLabel");
+        close("NucLabel");
+        // LabelMask is now: 0=bg, 1=cyto, 2=nuc
+		selectWindow("LabelMask");
+		
+		
+        // --- 4. Build edge overlays for QC (before expand consumes LabelMask) ---
+        selectWindow("LabelMask");
+        run("Duplicate...", "title=CytoEdgeSrc");
+        selectWindow("CytoEdgeSrc");
+        setThreshold(1, 1);
+        run("Convert to Mask");
+        run("Find Edges");
         run("Cyan");
+        rename("CytoEdges");
 
-        selectWindow("NucMask");
-        run("Duplicate...", "duplicate");
-        rename("NucEdges");
-        selectWindow("NucEdges");
-        run("Find Edges", "stack");
+        selectWindow("LabelMask");
+        run("Duplicate...", "title=NucEdgeSrc");
+        selectWindow("NucEdgeSrc");
+        setThreshold(2, 2);
+        run("Convert to Mask");
+        run("Find Edges");
         run("Green");
+        rename("NucEdges");
 
-        // --- 5. Merge channels ---
+        // --- 5. Expand label mask to full-depth stack ---
+        expandToStack("LabelMask", totalFrames, "LabelStack");
+
+         // --- 6. Merge channels ---
         run("Merge Channels...",
-            "c1=[" + rawTitle + "] c2=[NucMask] c3=[CytoMask] create");
+            "c1=[" + rawTitle + "] c4=[LabelStack] create");
         mergedID = getImageID();
 
-        // --- 6. Stamp edge overlays ---
+        // --- 6b. Stamp edge overlays ---
         selectImage(mergedID);
         run("Add Image...", "image=CytoEdges x=0 y=0 opacity=100 zero");
         run("Add Image...", "image=NucEdges  x=0 y=0 opacity=100 zero");
-
         close("CytoEdges");
         close("NucEdges");
 
         // --- 7. Set stack properties ---
         selectImage(mergedID);
-        Stack.setActiveChannels("100");
+        Stack.setActiveChannels("10");
         run("Properties...",
-            "channels=3 slices=1 frames=" + totalFrames +
+            "channels=2 slices=1 frames=" + totalFrames +
             " unit=" + vunit +
             " pixel_width=" + vw +
             " pixel_height=" + vh +
             " voxel_depth=1.0000" +
             " frame=[" + frameInterval + " sec]");
+
+        
 
         // --- 8. Save ---
         saveAs("Tiff", outputPath);
@@ -480,7 +506,6 @@ function expandToStack(sourceTitle, nFrames, newName) {
 
     selectWindow(newName);
 }
-
 
 ```
 
@@ -603,7 +628,7 @@ def GAP_DIST      = 0.9 as Double
 def MAX_FRAME_GAP = 1 as Integer
 
 // Filters
-def QUALITY_MIN   = 70 as Double
+def QUALITY_MIN   = 90 as Double
 def DURATION_MIN  = 0.068  as Double
 
 // --- BATCH LOOP ---
@@ -1019,3 +1044,9 @@ Jump length distributions were analysed using the Spot-On framework (Hansen et a
 
 
 It can also output the raw information to replot the ridge plots, which were used to determine the fraction of the two populations. 
+
+
+To do:
+put in photobleach correction
+confirm quality parameter
+fix mask creation to let nuclear overwrite cytoplasm
